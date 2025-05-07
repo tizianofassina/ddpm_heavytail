@@ -1,6 +1,7 @@
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 """
 We implement a classical UNet model as sketched in the paper 
@@ -104,11 +105,20 @@ class UNet(nn.Module):
     
     
     def center_crop(self, layer, target_size):
+        """
+        Center-crop a 4D tensor (N, C, H, W) to the target size.
+
+        Args:
+            layer (torch.Tensor): Input tensor of shape (N, C, H, W)
+            target_size (tuple): Desired output size (target_height, target_width)
+
+        Returns:
+            torch.Tensor: Center-cropped tensor
+        """
         _, _, h, w = layer.size()
         diff_y = (h - target_size[0]) // 2
         diff_x = (w - target_size[1]) // 2
-        return layer[:, :, diff_y:(diff_y + target_size[0]), diff_x:(diff_x + target_size[1])]
-
+        return layer[:, :, diff_y:diff_y + target_size[0], diff_x:diff_x + target_size[1]]
     def forward(self, x):
         x1 = self.conv_1(x)
         p1 = self.pool_1(x1)
@@ -151,8 +161,10 @@ class UNet(nn.Module):
 
 
 class UNet_mnist(nn.Module):
-    def __init__(self):
+    def __init__(self, chan_input = 1, chan_output = 2):
         super().__init__()
+        self.chan_input = chan_input
+        self.chan_output = chan_output
         self.conv_1 = nn.Sequential(
             nn.Conv2d(chan_input, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -187,7 +199,7 @@ class UNet_mnist(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, chan_input, kernel_size=1)) # 28 x 28
+            nn.Conv2d(64, chan_output, kernel_size=1)) # 28 x 28
         
         
     def forward(self, x):
@@ -214,13 +226,16 @@ class UNet_mnist(nn.Module):
 
 
 class UNet_mnist_time(nn.Module):
-    def __init__(self):
-        super().__init__(time_emb_dim = 64)
+    def __init__(self, time_emb_dim = 64, chan_input = 1, chan_output = 1):
+        super().__init__()
+        self.chan_input = chan_input
+        self.chan_output = chan_output
+        self.time_emb_dim = time_emb_dim
         
         self.linear_1 = nn.Linear(time_emb_dim, 128)
         self.linear_2 = nn.Linear(time_emb_dim, 256)
         self.linear_3 = nn.Linear(time_emb_dim, 128)
-        self.linear_4 = nn.Linear(time_emb_dim, 64)
+        self.linear_4 = nn.Linear(time_emb_dim, 128)
         
         self.conv_1 = nn.Sequential(
             nn.Conv2d(chan_input, 64, kernel_size=3, padding=1),
@@ -256,35 +271,40 @@ class UNet_mnist_time(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, chan_input, kernel_size=1)) # 28 x 28
+            nn.Conv2d(64, chan_output, kernel_size=1)) # 28 x 28
         
         
     def forward(self, x, t):
-        x1 = self.conv_1(x) #  28 x 28
+        batch_size = x.shape[0]
+        
+        x1 = self.conv_1(x)  # batch x 64 x 28 x 28
+        
         t_emb = get_timestep_embedding(t, self.time_emb_dim)
         
-        t_emb_1 = self.linear_1(t_emb).view(batch_size, 64, 1, 1) # batch x 64 x 1  x 1
-
-        x2 = self.conv_2(x1) + t_emb_1 # 1 x 64 x 28 x 28
-        p2 = self.pool_1(x2) # 1 x 64 x 14 x 14 
-
-        x3 = self.conv_3(p2) # 1 x 128 x 14 x 14 
+        t_emb_1 = self.linear_1(t_emb).view(batch_size, 128, 1, 1)
         
-        t_emb_2 = self.linear_2(t_emb).view(batch_size, 128, 1, 1) # batch x 128 x 1  x 1
+        x2 = self.conv_2(x1) + t_emb_1  # batch x 128 x 28 x 28
+        p2 = self.pool_1(x2)            # batch x 128 x 14 x 14
+        
+        x3 = self.conv_3(p2)             # batch x 256 x 14 x 14
+        t_emb_2 = self.linear_2(t_emb).view(batch_size, 256, 1, 1)
+        
         x3 = x3 + t_emb_2
+        p3 = self.pool_2(x3)             # batch x 256 x 7 x 7
         
-        p3 = self.pool_2(x3) # 7 x 7
+        u3 = self.upconv_1(p3)           # batch x 128 x 14 x 14
         
-        u3 = self.upconv_1(p3) # 1 x 256 x 14 x 14
+        cat_1 = torch.cat([p2, u3], dim=1)  # batch x 256 x 14 x 14
         
-        cat_1 = torch.cat([x3, u3], dim=1)
-        u2 = self.conv_4(cat_1) # 14 x 14
+        t_emb_3 = self.linear_3(t_emb).view(batch_size, 128, 1, 1)
         
-        u2 = self.upconv_2(u2)
+        u2 = self.conv_4(cat_1) + t_emb_3  # batch x 128 x 14 x 14
+        u2 = self.upconv_2(u2)              # batch x 64 x 28 x 28
         
-        cat_2 = torch.cat([x2, u2], dim=1) # 28 x 28
+        cat_2 = torch.cat([x1, u2], dim=1)  # batch x 128 x 28 x 28
         
+        t_emb_4 = self.linear_4(t_emb).view(batch_size, 128, 1, 1)
+        cat_2 = cat_2 + t_emb_4
         
-        return self.conv_5(cat_2) # 28 x 28
-
-        
+        return self.conv_5(cat_2)            # batch x 1 x 28 x 28
+ 
